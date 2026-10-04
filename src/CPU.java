@@ -10,9 +10,32 @@ public class CPU {
     private int sp; // 栈指针
     private int delayTimer; // 延时定时器，60hz递减直到0停止
     private int soundTimer; // 声音定时器，60hz递减，大于0时发出声音
-    private boolean[] keyboard = new boolean[16]; // 十六进制键盘，0-F共16个键
-    private boolean[] display = new boolean[64 * 32]; //显示屏，64 * 32的单色像素窗口
-    private boolean drawFlag; // 标记是否重绘
+    private final boolean[] keyboard = new boolean[16]; // 十六进制键盘，0-F共16个键
+
+    // 显示屏 64*32 的单色像素。这里分成两块缓冲，是消除画面闪烁的关键：
+    //   display     —— 实时缓冲：DXYN 的异或翻转、碰撞检测都发生在这里，随时可能只画了一半
+    //   frameBuffer —— 呈现缓冲：只有当一整帧确实画完了，才整块拷贝过去；屏幕永远只读它
+    private final boolean[] display = new boolean[64 * 32];
+    private final boolean[] frameBuffer = new boolean[64 * 32];
+
+    private boolean dirty; // 画面自上次提交以来有没有改动过
+    private boolean newFrame; // 已经攒出一帧完整画面，等 Main 来取
+    private int ticksSinceLoopBack; // 距 ROM 上次往回跳过去了几个 tick（初值 0：先给 ROM 一点时间跑出第一圈）
+
+    /**
+     * 兜底上限：连续多少个 tick 都没等到 ROM 往回跳，就强行把当前画面提交出去（≈16ms × 该值）。
+     * 只有结构特殊的 ROM（一直没有回跳）才会用到它，免得画面僵住不动；
+     * 正常的 ROM 每帧都会回跳，这个兜底永远不会触发，也就不会把半成品画面显示出去。
+     */
+    public static int maxHoldTicks = 8;
+
+    /**
+     * FX55 / FX65 结束后是否把 I 前进 x+1。
+     * 原版 COSMAC VIP 会前进（默认打开）
+     * 少数按 CHIP-48 / SCHIP 规范写的 ROM 期望 I 保持不变，那种情况把它设成 false。
+     */
+    public static boolean incrementIOnMemoryOps = true;
+
     private boolean waitingForKey = false; // 是否等待按键输入
     private int waitingRegister; // 哪个寄存器接收键值
 
@@ -78,13 +101,15 @@ public class CPU {
                         pc = stack[--sp];
                     }
                     case 0xE0 -> { // 清空屏幕
-                        for (int i = 0; i < 64 * 32; i++) {
-                            display[i] = false;
-                        }
+                        java.util.Arrays.fill(display, false);
+                        dirty = true;
                     }
                 } // 进一步判断是哪个指令
             } // 系统指令
-            case 0x1000 -> pc = nnn; // 跳转
+            case 0x1000 -> { // 跳转
+                if (nnn <= pc - 2) onLoopBack(); // 往回跳：ROM 又跑完一圈了，正是提交完整画面的时机
+                pc = nnn;
+            }
             case 0x2000 -> {
                 stack[sp++] = pc;
                 pc = nnn;
@@ -105,7 +130,11 @@ public class CPU {
                 if (V[x] != V[y]) pc += 2;
             } // 不等跳过
             case 0xA000 -> I = nnn; // 设置地址
-            case 0xB000 -> pc = nnn + V[0]; // 偏移跳转
+            case 0xB000 -> { // 偏移跳转
+                int target = nnn + V[0];
+                if (target <= pc - 2) onLoopBack();
+                pc = target;
+            }
             case 0xC000 -> V[x] = (int) (Math.random() * 256) & nn; // 随机数
             case 0xD000 -> drawSprite(x, y, n); // 绘制精灵：从I开始读n字节，在(x,y)处画像素
             case 0xE000 -> executeExxx(x, nn); // 按键跳过
@@ -171,10 +200,12 @@ public class CPU {
             case 0x55 -> {
                 for (int i = 0; i <= x; i++)
                     memory[I + i] = (byte) V[i];
+                if (incrementIOnMemoryOps) I = (I + x + 1) & 0xFFF;
             } // 把V0..Vx写入内存I..I+x
             case 0x65 -> {
                 for (int i = 0; i <= x; i++)
                     V[i] = memory[I + i];
+                if (incrementIOnMemoryOps) I = (I + x + 1) & 0xFFF;
             } // 从内存I开始读入V0..Vx
         }
     }
@@ -191,7 +222,7 @@ public class CPU {
     }
 
     private void drawSprite(int x, int y, int n) {
-        drawFlag = true;
+        dirty = true; // 画面改动过，攒着等一次完整帧的提交时机
         // 1.VF置为0
         V[0xF] = 0;
 
@@ -226,14 +257,48 @@ public class CPU {
         }
     }
 
-    public boolean[] getDisplay() {
-        return display;
+    public boolean[] getFrameBuffer() {
+        return frameBuffer;
+    }
+
+    private void onLoopBack() {
+        ticksSinceLoopBack = 0; // 说明这个 ROM 会成圈地跑，兜底就不必插手了
+        if (!dirty) return; // 这一圈没画东西，不用重复提交
+        commitFrame();
+        newFrame = true;
+    }
+
+    private void commitFrame() {
+        System.arraycopy(display, 0, frameBuffer, 0, display.length);
+        dirty = false;
+    }
+
+    public boolean publishFrame() {
+        if (ticksSinceLoopBack < 999) ticksSinceLoopBack++;
+
+        if (newFrame) {      // 这一 tick 里 ROM 回了圈，完整画面已经就位
+            newFrame = false;
+            return true;
+        }
+        if (!dirty) return false; // 画面没变过，没必要重绘
+
+        // 兜底：一直等不到回跳的 ROM，也不能让画面僵住
+        if (ticksSinceLoopBack >= maxHoldTicks) {
+            commitFrame();
+            return true;
+        }
+        return false;
     }
 
     public void updateTimers() {
         if (delayTimer > 0) delayTimer -= 1;
-        if (soundTimer > 0) soundTimer -= 1;
-    }
+        if (soundTimer > 0) {
+            soundTimer -= 1;
+            Sound.playSound();
+        } else {
+            Sound.stopSound();
+        }
+     }
 
     public boolean[] getKeyboard() {
         return keyboard;
