@@ -2,17 +2,19 @@
 // 模拟器核心，包含：内存、寄存器、指令解码与执行
 public class CPU {
 
-    byte[] memory = new byte[4096]; // 内存 4kb
-    int[] V = new int[16]; // 数据寄存器，8位
-    int I; // 地址寄存器，12位
-    int pc = 0x200; // 程序计数器。指向下一条指令。指令从内存的0x200开始，一个指令2个字节，8位
-    int[] stack = new int[16]; // 栈 16层
-    int sp; // 栈指针，指向栈顶
-    int delayTimer; // 延时定时器，60hz递减直到0停止
-    int soundTimer; // 声音定时器，60hz递减，大于0时发出声音
-    boolean[] keyboard = new boolean[16]; // 十六进制键盘，0-F共16个键
-    boolean[] display = new boolean[64 * 32]; //显示屏，64 * 32的单色像素窗口
-    boolean drawFlag; // 标记是否重绘
+    private byte[] memory = new byte[4096]; // 内存 4kb
+    private int[] V = new int[16]; // 数据寄存器，8位
+    private int I; // 地址寄存器，12位
+    private int pc = 0x200; // 指向下一条指令。指令从内存的0x200开始，一个指令2个字节，8位
+    private int[] stack = new int[16]; // 栈 16层
+    private int sp; // 栈指针
+    private int delayTimer; // 延时定时器，60hz递减直到0停止
+    private int soundTimer; // 声音定时器，60hz递减，大于0时发出声音
+    private boolean[] keyboard = new boolean[16]; // 十六进制键盘，0-F共16个键
+    private boolean[] display = new boolean[64 * 32]; //显示屏，64 * 32的单色像素窗口
+    private boolean drawFlag; // 标记是否重绘
+    private boolean waitingForKey = false; // 是否等待按键输入
+    private int waitingRegister; // 哪个寄存器接收键值
 
     // CHIP-8内置字体集
     private static final int[] FONT_SET = {
@@ -37,7 +39,7 @@ public class CPU {
     // 加载ROM
     public void loadRom(byte[] rom) {
         // 将ROM程序拷贝到内存当中
-        System.arraycopy(rom,0,memory,0x200,rom.length);
+        System.arraycopy(rom, 0, memory, 0x200, rom.length);
         // 将内置字体集加载到内存中
         for (int i = 0; i < FONT_SET.length; i++) {
             memory[0x50 + i] = (byte) FONT_SET[i];
@@ -46,6 +48,17 @@ public class CPU {
 
     // 取指令、解码、执行的核心循环
     public void cycle() {
+        if (waitingForKey) {
+            for (int i = 0; i < 16; i++) {
+                if (keyboard[i]) {
+                    V[waitingRegister] = i;
+                    waitingForKey = false;
+                    break;
+                }
+            }
+            return;  // 不执行下一条指令
+        } // 等待按键输入时，不执行指令
+
         // 1.取指令 一条指令两个字节，所以取memory[pc] + memory[pc + 1]，取完pc += 2指向下一个指令
         int opcode = ((memory[pc] & 0xFF) << 8) | memory[pc + 1] & 0xFF;
         pc += 2;
@@ -62,7 +75,7 @@ public class CPU {
             case 0x0000 -> {
                 switch (nn & 0xFF) {
                     case 0xEE -> {// 从子程序返回
-
+                        pc = stack[--sp];
                     }
                     case 0xE0 -> { // 清空屏幕
                         for (int i = 0; i < 64 * 32; i++) {
@@ -72,17 +85,28 @@ public class CPU {
                 } // 进一步判断是哪个指令
             } // 系统指令
             case 0x1000 -> pc = nnn; // 跳转
-            case 0x2000 -> { stack[sp++] = pc; pc = nnn; } // 调用子程序
-            case 0x3000 -> { if (V[x] == nn) pc += 2; } // 相等跳过
-            case 0x4000 -> { if (V[x] != nn) pc += 2; } // 不等跳过
-            case 0x5000 -> { if (V[x] == V[y]) pc += 2; } // 相等跳过
+            case 0x2000 -> {
+                stack[sp++] = pc;
+                pc = nnn;
+            } // 调用子程序
+            case 0x3000 -> {
+                if (V[x] == nn) pc += 2;
+            } // 相等跳过
+            case 0x4000 -> {
+                if (V[x] != nn) pc += 2;
+            } // 不等跳过
+            case 0x5000 -> {
+                if (V[x] == V[y]) pc += 2;
+            } // 相等跳过
             case 0x6000 -> V[x] = nn; // 赋值
             case 0x7000 -> V[x] = (V[x] + nn) & 0xFF; // 寄存器加立即数
             case 0x8000 -> execute8xxx(x, y, n); // 算术与逻辑运算
-            case 0x9000 -> { if (V[x] != V[y]) pc += 2; } // 不等跳过
+            case 0x9000 -> {
+                if (V[x] != V[y]) pc += 2;
+            } // 不等跳过
             case 0xA000 -> I = nnn; // 设置地址
             case 0xB000 -> pc = nnn + V[0]; // 偏移跳转
-            case 0xC000 -> V[x] = (int)(Math.random() * 256) & nn; // 随机数
+            case 0xC000 -> V[x] = (int) (Math.random() * 256) & nn; // 随机数
             case 0xD000 -> drawSprite(x, y, n); // 绘制精灵：从I开始读n字节，在(x,y)处画像素
             case 0xE000 -> executeExxx(x, nn); // 按键跳过
             case 0xF000 -> executeFxxx(x, nn); // 定时器、内存、十进制拆分、键盘
@@ -131,7 +155,10 @@ public class CPU {
     private void executeFxxx(int x, int nn) {
         switch (nn) {
             case 0x07 -> V[x] = delayTimer;
-            case 0x0A -> waitForKey(x); // 等待按键，将键值存入Vx
+            case 0x0A -> {
+                waitingForKey = true;
+                waitingRegister = x;
+            } // 等待按键，将键值存入Vx
             case 0x15 -> delayTimer = V[x];
             case 0x18 -> soundTimer = V[x];
             case 0x1E -> I = (I + V[x]) & 0xFFF;
@@ -154,12 +181,17 @@ public class CPU {
 
     private void executeExxx(int x, int nn) {
         switch (nn) {
-            case 0x9E -> {if (keyboard[V[x]]) pc += 2;} // 键被按下则跳过
-            case 0xA1 -> {if (!keyboard[V[x]]) pc += 2;} // 键没被按下则跳过
+            case 0x9E -> {
+                if (keyboard[V[x]]) pc += 2;
+            } // 键被按下则跳过
+            case 0xA1 -> {
+                if (!keyboard[V[x]]) pc += 2;
+            } // 键没被按下则跳过
         }
     }
 
     private void drawSprite(int x, int y, int n) {
+        drawFlag = true;
         // 1.VF置为0
         V[0xF] = 0;
 
@@ -194,8 +226,17 @@ public class CPU {
         }
     }
 
-    private void waitForKey(int x) {
-        System.out.println("暂未实现等待键盘输入");
+    public boolean[] getDisplay() {
+        return display;
+    }
+
+    public void updateTimers() {
+        if (delayTimer > 0) delayTimer -= 1;
+        if (soundTimer > 0) soundTimer -= 1;
+    }
+
+    public boolean[] getKeyboard() {
+        return keyboard;
     }
 
 }
